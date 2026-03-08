@@ -60,7 +60,12 @@ function discord_postmessage(hook, msg){
 
 function create_worker(game_id, game_type) {
 	const worker = new Worker(base + '/game/game.js', { workerData: [game_id, game_type] });
-	worker.on('error', (err) => { throw err; });
+	worker.on('error', (err) => {
+		logger.error({ err, game_id }, 'Worker crashed; deactivating game');
+		trigger_deactivation(game_id);
+		delete active_games[game_id];
+		delete workers[game_id];
+	});
 	worker.on('message', (render_data) => {
 		if (render_data.meta == 'initiate'){
 			try {
@@ -77,9 +82,13 @@ function create_worker(game_id, game_type) {
 			wss.broadcast(render_data.data, render_data.user_data, render_data.game_id);
 		}
 	});
-	worker.on('exit', () => {
+	worker.on('exit', (code) => {
+		if (code !== 0) {
+			logger.warn({ game_id, exit_code: code }, 'Worker exited non-zero');
+		}
 		trigger_deactivation(game_id);
 		delete active_games[game_id];
+		delete workers[game_id];
 	});
 
 	workers[game_id] = worker;
@@ -221,95 +230,120 @@ wss.on('connection', function connection(ws, req) {
 	initiate_world(ws.client_id, g_id);
 
 	ws.on('message', async function incoming(message) {
-		let active_game = active_games[g_id];
-		if (active_game == undefined){
-			return;
-		}
-
-		if (message == 'reinitiate'){
-			initiate_world(ws.client_id, g_id);
-			return;
-		} else {
-			try {
-				message = JSON.parse(message);
-			} catch (error) {
-				logger.error(error);
+		try {
+			let active_game = active_games[g_id];
+			if (active_game == undefined){
 				return;
 			}
-			if (message.meta == "resign"){
-				if (message['u_id'] == active_game[1]) resigning1 = 1;
-				if (message['u_id'] == active_game[2]) resigning2 = 1;
+
+			if (message == 'reinitiate'){
+				initiate_world(ws.client_id, g_id);
+				return;
 			} else {
-				resigning1 = 0;
-				resigning2 = 0;
-			}
-		}
-
-		if(message.meta == 'connect') {
-			let session = await Session.findOne({session_id: message.session_id}).exec();
-			if(session) {
-				ws.user_id = session.user_id;
-				ws.send(JSON.stringify({meta: 'connected', user_id: ws.user_id}));
-			}
-			return;
-		}
-
-		if(message.meta == 'channel') {
-			workers[g_id].postMessage({data: "channel", user_id: ws.user_id || "anonymous", channel: message.channel, chan_data: message.data});
-			return;
-		}
-
-		if (message['u_code_lang'] != undefined && message['u_code_lang'] != "javascript") {
-			let req = await fetch(config.frontendAddress + "/transpiler/transpile", {method: "POST", body: JSON.stringify({code: message['u_code'], language: message['u_code_lang']}), headers: {'Content-Type': 'application/json', 'X-Transpiler-Secret': config.transpilerSecret}});
-			let res = await req.json();
-			if (res.result) message['u_code'] = res.result;
-			if (res.error) {
-				let tempJSON = JSON.stringify(JSON.stringify({error: res.error}));
-				message['u_code'] = `throw JSON.parse(${tempJSON})["error"];`;
-			}
-		}
-
-		let modulesInjectionStartTime = Date.now();
-		let user = await User.findOne({"user_id": message['u_id']});
-		let active_module_code_locations;
-		if (user) {
-			let promised_active_modules = user.active_modules.map(module_id => Module.findOne({module_id}));
-			let active_modules = await Promise.all(promised_active_modules);
-			active_module_code_locations = active_modules.map((mod, i) => {
-				if (mod == null){
-					return `local/${user.active_modules[i]}`
+				try {
+					message = JSON.parse(message);
+				} catch (error) {
+					logger.error(error);
+					return;
 				}
-				return `${mod.server_script_location}/${mod.module_id}`
-			}).filter(loc => loc !== "local" && loc !== null);
-		} else {
-			active_module_code_locations = [];
-		}
-
-		let promised_active_module_codes = active_module_code_locations.map((loc) => {
-			if (loc.startsWith("local/")) {
-				return fetch(`${config.frontendAddress}/public-modules/${loc.replace("local", "server")}.js`).then(r => r.text());
+				if (message.meta == "resign"){
+					if (message['u_id'] == active_game[1]) resigning1 = 1;
+					if (message['u_id'] == active_game[2]) resigning2 = 1;
+				} else {
+					resigning1 = 0;
+					resigning2 = 0;
+				}
 			}
-			return s3client.getObject({
-				Bucket: config.s3.bucket,
-				Key: `${loc}.js`,
-			}).promise().then(r => r.Body.toString('utf8'));
-		});
 
-		let active_module_codes = await Promise.all(promised_active_module_codes);
-		let active_module_codes_joined = `;${active_module_codes.join("\n\n\n")};`;
-		message['u_code'] += active_module_codes_joined;
-		let moduleInjectionTime = Date.now() - modulesInjectionStartTime;
-		logger.debug('Module injection took %dms', moduleInjectionTime);
+			if(message.meta == 'connect') {
+				let session = await Session.findOne({session_id: message.session_id}).exec();
+				if(session) {
+					ws.user_id = session.user_id;
+					ws.send(JSON.stringify({meta: 'connected', user_id: ws.user_id}));
+				}
+				return;
+			}
 
-		connections[ws.client_id] = ws;
-		try {
-			if (message['u_id'] == active_game[1] || active_game[1] == 'anonymous'){
-				send_code(ws.client_id, 'player1', message['u_id'], message['u_code'], g_id, message['session_id'], resigning1);
-			} else if (message['u_id'] == active_game[2]){
-				send_code(ws.client_id, 'player2', message['u_id'], message['u_code'], g_id, message['session_id'], resigning2);
+			if(message.meta == 'channel') {
+				workers[g_id].postMessage({data: "channel", user_id: ws.user_id || "anonymous", channel: message.channel, chan_data: message.data});
+				return;
+			}
+
+			if (message['u_code_lang'] != undefined && message['u_code_lang'] != "javascript") {
+				let req = await fetch(config.frontendAddress + "/transpiler/transpile", {method: "POST", body: JSON.stringify({code: message['u_code'], language: message['u_code_lang']}), headers: {'Content-Type': 'application/json', 'X-Transpiler-Secret': config.transpilerSecret}});
+				let res = await req.json();
+				if (res.result) message['u_code'] = res.result;
+				if (res.error) {
+					let tempJSON = JSON.stringify(JSON.stringify({error: res.error}));
+					message['u_code'] = `throw JSON.parse(${tempJSON})["error"];`;
+				}
+			}
+
+			let modulesInjectionStartTime = Date.now();
+			let active_module_codes_joined = '';
+			try {
+				let user = await User.findOne({"user_id": message['u_id']});
+				let active_module_code_locations;
+				if (user) {
+					let promised_active_modules = user.active_modules.map(module_id => Module.findOne({module_id}));
+					let active_modules = await Promise.all(promised_active_modules);
+					active_module_code_locations = active_modules.map((mod, i) => {
+						if (mod == null){
+							return `local/${user.active_modules[i]}`;
+						}
+						return `${mod.server_script_location}/${mod.module_id}`;
+					}).filter(loc => loc !== "local" && loc !== null);
+				} else {
+					active_module_code_locations = [];
+				}
+
+				let promised_active_module_codes = active_module_code_locations.map(async (loc) => {
+					try {
+						if (loc.startsWith("local/")) {
+							const moduleResponse = await fetch(`${config.frontendAddress}/public-modules/${loc.replace("local", "server")}.js`);
+							if (!moduleResponse.ok) {
+								if (moduleResponse.status === 404) {
+									logger.warn({ game_id: g_id, user_id: message['u_id'], module_location: loc }, 'Local module missing; skipping');
+									return '';
+								}
+								throw new Error(`Failed to fetch local module ${loc}: ${moduleResponse.status}`);
+							}
+							return moduleResponse.text();
+						}
+						return s3client.getObject({
+							Bucket: config.s3.bucket,
+							Key: `${loc}.js`,
+						}).promise().then(r => r.Body.toString('utf8'));
+					} catch (err) {
+						if (err && (err.code === 'NoSuchKey' || err.statusCode === 404)) {
+							logger.warn({ game_id: g_id, user_id: message['u_id'], module_location: loc }, 'S3 module key missing; skipping');
+							return '';
+						}
+						throw err;
+					}
+				});
+
+				let active_module_codes = (await Promise.all(promised_active_module_codes)).filter(Boolean);
+				active_module_codes_joined = `;${active_module_codes.join("\n\n\n")};`;
+				let moduleInjectionTime = Date.now() - modulesInjectionStartTime;
+				logger.debug('Module injection took %dms', moduleInjectionTime);
+			} catch (error) {
+				logger.error({ err: error, game_id: g_id, user_id: message['u_id'] }, 'Module injection failed; continuing without modules');
+			}
+			message['u_code'] = (message['u_code'] || '') + active_module_codes_joined;
+
+			connections[ws.client_id] = ws;
+			try {
+				if (message['u_id'] == active_game[1] || active_game[1] == 'anonymous'){
+					send_code(ws.client_id, 'player1', message['u_id'], message['u_code'], g_id, message['session_id'], resigning1);
+				} else if (message['u_id'] == active_game[2]){
+					send_code(ws.client_id, 'player2', message['u_id'], message['u_code'], g_id, message['session_id'], resigning2);
+				}
+			} catch (error) {
+				logger.error(error);
 			}
 		} catch (error) {
-			logger.error(error);
+			logger.error({ err: error, game_id: g_id }, 'Unhandled websocket message error');
 		}
 	});
 

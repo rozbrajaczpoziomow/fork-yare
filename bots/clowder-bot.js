@@ -2,6 +2,16 @@
 //  Clowder Bot — each cat has its own mind (and name)
 // ============================================================
 
+const PEW_RANGE = 200;
+const MOVE_SPEED = 20;
+const PEW_RANGE_NEXT_TICK = PEW_RANGE + MOVE_SPEED;  // 220 — can pew after 1 tick of movement
+const POTENTIAL_THREAT_RANGE = PEW_RANGE_NEXT_TICK + MOVE_SPEED;  // 240 — enemies within this could move into pew range next tick
+const SURROUND_RADIUS = 270;   // hold >260 during setup
+const SURROUND_STRIKE_RANGE = 220;  // within 220 → can cross pew (200) in 1 tick
+const SURROUND_SAFE_FROM_OTHERS = 250;  // keep 250+ from non-target enemies when positioning
+const STALL_WINDOW = 10;       // ticks to observe — trigger spread sooner
+const STALL_THRESHOLD = 60;    // max centroid drift — detect standoffs earlier
+
 // ----- Geometry helpers -----
 
 function dist(a, b) {
@@ -34,6 +44,20 @@ function away(from, threat, amount) {
         from[0] + (from[0] - threat[0]) * ratio,
         from[1] + (from[1] - threat[1]) * ratio,
     ];
+}
+
+const MAX_RETREAT_FROM_TEAM = 400;
+
+function safeRetreat(cat, threatPos, amount) {
+    const amt = amount ?? 25;
+    const ours = aliveOf(my_cats);
+    if (ours.length <= 1) return away(cat.position, threatPos, amt);
+    const teamCenter = centroid(ours.filter(c => c.id !== cat.id).map(c => c.position));
+    const distFromTeam = dist(cat.position, teamCenter);
+    if (distFromTeam > MAX_RETREAT_FROM_TEAM) {
+        return towards(cat.position, teamCenter, Math.min(amt, 50));
+    }
+    return away(cat.position, threatPos, amt);
 }
 
 function centroid(positions) {
@@ -206,6 +230,8 @@ if (!memory.initialized) {
     memory.initialized = true;
     memory.cats = {};
     memory.mourning = {};
+    memory.stallHistory = { our: [], theirs: [] };
+    memory.surround = null;
     for (let i = 0; i < my_cats.length; i++) {
         const name = CAT_NAMES[i] || ('Cat' + i);
         memory.cats[my_cats[i].id] = {
@@ -303,37 +329,355 @@ function aggroSharedTarget() {
     const enemies = livingEnemies();
     if (trio.length === 0 || enemies.length === 0) return null;
     const center = centroid(trio.map(c => c.position));
-    return closestTo(center, enemies);
+
+    // Prefer isolated targets (surgical strike) — enemy with fewest nearby allies
+    let best = null, bestScore = -Infinity;
+    for (const e of enemies) {
+        const nearbyAllies = enemies.filter(o => o.id !== e.id && dist(o.position, e.position) <= 80).length;
+        const isolation = 10 - nearbyAllies;  // higher = more isolated
+        const distFromUs = -dist(center, e.position) / 100;  // prefer closer
+        const score = isolation * 2 + distFromUs;
+        if (score > bestScore) { bestScore = score; best = e; }
+    }
+    return best || closestTo(center, enemies);
+}
+
+// Engagement analysis: count cats that can participate in a fight (this or next tick).
+// Pew range 200, move 20/tick → within 220 can pew after at most 1 tick.
+function engagementCounts(target) {
+    if (!target) return { ours: 0, theirs: 0, safeToStrike: false };
+    const friends = aliveOf(my_cats);
+    const enemies = livingEnemies();
+
+    const ourEngagers = friends.filter(f => dist(f.position, target.position) <= PEW_RANGE_NEXT_TICK);
+    const enemyInZone = enemies.filter(e => dist(e.position, target.position) <= PEW_RANGE_NEXT_TICK);
+
+    const ours = ourEngagers.length;
+    const theirs = enemyInZone.length;
+
+    // Don't strike if outnumbered or even
+    if (ours <= theirs) return { ours, theirs, safeToStrike: false };
+
+    // Check "under fire next tick": when we advance, would our cats get focus-fired?
+    // For each engager, count enemies that could pew them (within 220 of that cat).
+    // If any cat would have more enemies on them than allies nearby, don't risk it.
+    let safeToStrike = true;
+    for (const f of ourEngagers) {
+        const enemiesOnMe = enemies.filter(e => dist(e.position, f.position) <= PEW_RANGE_NEXT_TICK);
+        const alliesOnMe = friends.filter(a => a.id !== f.id && dist(a.position, f.position) <= PEW_RANGE_NEXT_TICK);
+        if (enemiesOnMe.length > alliesOnMe.length) {
+            safeToStrike = false;
+            break;
+        }
+    }
+
+    return { ours, theirs, safeToStrike };
+}
+
+function hasEnergyAdvantage() {
+    const ours = aliveOf(my_cats);
+    const theirs = livingEnemies();
+    const ourEnergy = ours.reduce((s, c) => s + c.energy, 0);
+    const theirEnergy = theirs.reduce((s, e) => s + e.energy, 0);
+    return ourEnergy > theirEnergy;
+}
+
+/** True when we have numbers (>= theirs) and more total energy — go for it! */
+function hasMajorityAdvantage() {
+    const ours = aliveOf(my_cats);
+    const theirs = livingEnemies();
+    return ours.length >= theirs.length && hasEnergyAdvantage();
 }
 
 function teamCanEngage(target) {
     if (!target) return false;
-    const friends = aliveOf(my_cats);
-    const enemies = livingEnemies();
+    const { ours, theirs, safeToStrike } = engagementCounts(target);
+    if (ours > theirs && safeToStrike) return true;
+    if (ours >= theirs && hasEnergyAdvantage()) return true;
+    return false;
+}
 
-    let convergers = 0;
-    for (const f of friends) {
-        if (dist(f.position, target.position) <= 280) convergers++;
+// ============================================================
+//  Surround plan — break stalls by circling a target, then striking
+// ============================================================
+
+function updateStallHistory() {
+    const ours = aliveOf(my_cats);
+    const theirs = livingEnemies();
+    if (ours.length === 0 || theirs.length === 0) return;
+    const ourCentroid = centroid(ours.map(c => c.position));
+    const theirCentroid = centroid(theirs.map(e => e.position));
+    memory.stallHistory.our.push(ourCentroid);
+    memory.stallHistory.theirs.push(theirCentroid);
+    if (memory.stallHistory.our.length > STALL_WINDOW) {
+        memory.stallHistory.our.shift();
+        memory.stallHistory.theirs.shift();
+    }
+}
+
+function isStalling() {
+    const our = memory.stallHistory.our;
+    const theirs = memory.stallHistory.theirs;
+    if (our.length < STALL_WINDOW || theirs.length < STALL_WINDOW) return false;
+    let ourMaxDrift = 0, theirMaxDrift = 0;
+    for (let i = 0; i < our.length; i++) {
+        for (let j = i + 1; j < our.length; j++) {
+            ourMaxDrift = Math.max(ourMaxDrift, dist(our[i], our[j]));
+            theirMaxDrift = Math.max(theirMaxDrift, dist(theirs[i], theirs[j]));
+        }
+    }
+    return ourMaxDrift < STALL_THRESHOLD && theirMaxDrift < STALL_THRESHOLD;
+}
+
+function isPositionSafeFromEnemyFire(pos) {
+    for (const e of livingEnemies()) {
+        if (dist(pos, e.position) <= PEW_RANGE_NEXT_TICK) return false;
+    }
+    return true;
+}
+
+/** Predict potential focus-fire: enemies that could move into pew range (220) next tick.
+ *  Returns { threatCenter } if we should retreat, else null.
+ *  Don't retreat when we have majority + energy advantage — go for it! */
+function predictPotentialFocusFire(cat) {
+    if (hasMajorityAdvantage()) return null;
+    const enemies = livingEnemies();
+    const inPewRange = enemies.filter(e => dist(cat.position, e.position) < PEW_RANGE_NEXT_TICK);
+    const potentialThreats = enemies.filter(e => dist(cat.position, e.position) < POTENTIAL_THREAT_RANGE);
+    if (inPewRange.length >= 2) {
+        return { threatCenter: centroid(inPewRange.map(e => e.position)) };
+    }
+    if (potentialThreats.length < 2) return null;
+    const alliesHere = friendsInRange(cat.position, 280);
+    if (alliesHere >= potentialThreats.length) return null;
+    return { threatCenter: centroid(potentialThreats.map(e => e.position)) };
+}
+
+/** Position is 250+ from all enemies except the surround target (for safe positioning). */
+function isPositionSafeFromOtherEnemies(pos, excludeTargetId, minDist) {
+    const d = minDist ?? SURROUND_SAFE_FROM_OTHERS;
+    for (const e of livingEnemies()) {
+        if (e.id === excludeTargetId) continue;
+        if (dist(pos, e.position) < d) return false;
+    }
+    return true;
+}
+
+/** Prefer enemies at the EDGE of their formation (weak points), not the center. */
+function weakPointTarget() {
+    const enemies = livingEnemies();
+    if (enemies.length === 0) return null;
+    const enemyCenter = centroid(enemies.map(e => e.position));
+    let best = null, bestScore = Infinity;
+    for (const e of enemies) {
+        const nearbyAllies = enemies.filter(o => o.id !== e.id && dist(o.position, e.position) <= 120).length;
+        const distFromCenter = dist(e.position, enemyCenter);
+        // Prefer fewer nearby allies (edge) and further from formation center (edge)
+        const score = nearbyAllies * 100 - distFromCenter;
+        if (score < bestScore) { bestScore = score; best = e; }
+    }
+    return best;
+}
+
+function surroundTarget() {
+    return weakPointTarget();
+}
+
+function getSurroundPositions(target, radius) {
+    const [tx, ty] = target.position;
+    const r = radius ?? SURROUND_RADIUS;
+    return [
+        [tx + r, ty],
+        [tx, ty + r],
+        [tx - r, ty],
+        [tx, ty - r],
+    ];
+}
+
+function getClosingPosition(catPos, targetPos) {
+    const d = dist(catPos, targetPos);
+    if (d <= SURROUND_STRIKE_RANGE) return catPos;
+    const ratio = SURROUND_STRIKE_RANGE / d;
+    return [
+        targetPos[0] + (catPos[0] - targetPos[0]) * ratio,
+        targetPos[1] + (catPos[1] - targetPos[1]) * ratio,
+    ];
+}
+
+function pickSurroundCats(target) {
+    const positions = getSurroundPositions(target);
+    const candidates = aliveOf(my_cats).filter(c => {
+        const me = identity(c);
+        return me && (me.role === 'aggro' || me.role === 'support' || me.role === 'connector'
+            || me.name === 'Ziggy');
+    });
+    if (candidates.length < 4) return [];
+    const assigned = [];
+    const used = new Set();
+    for (let i = 0; i < 4; i++) {
+        let best = null, bestDist = Infinity;
+        for (let j = 0; j < candidates.length; j++) {
+            if (used.has(j)) continue;
+            const d = dist(candidates[j].position, positions[i]);
+            if (d < bestDist) { bestDist = d; best = j; }
+        }
+        if (best !== null) {
+            used.add(best);
+            assigned.push({ catId: candidates[best].id, position: positions[i], slot: i });
+        }
+    }
+    return assigned;
+}
+
+function thinkSurround(cat, me) {
+    const s = memory.surround;
+    if (!s || !s.targetId) return false;
+    const target = cats[s.targetId];
+    if (!target || target.hp <= 0) {
+        memory.surround = null;
+        return false;
+    }
+    const mySlot = s.assignments.find(a => a.catId === cat.id);
+    if (!mySlot) return false;
+
+    if (s.phase === 'strike') {
+        cat.set_mark('strike!');
+        cat.move(target.position);
+        return true;
     }
 
-    const nearbyEnemies = enemies.filter(e => dist(e.position, target.position) <= 260);
-    const enemiesNear = nearbyEnemies.length;
+    if (s.phase === 'closing') {
+        const closePos = getClosingPosition(cat.position, target.position);
+        const safeFromOthers = livingEnemies().every(e => {
+            if (e.id === target.id) return true;
+            return dist(closePos, e.position) > PEW_RANGE_NEXT_TICK;
+        });
+        if (!safeFromOthers) {
+            const threat = livingEnemies().find(e => e.id !== target.id && dist(closePos, e.position) <= PEW_RANGE_NEXT_TICK);
+            if (threat) cat.move(safeRetreat(cat, threat.position, 25));
+            else cat.move(mySlot.position);
+            return true;
+        }
+        cat.set_mark('closing');
+        cat.move(closePos);
+        return true;
+    }
 
-    let clustered = 0;
-    for (const e of nearbyEnemies) {
-        for (const other of nearbyEnemies) {
-            if (other.id !== e.id && dist(e.position, other.position) <= 20) {
-                clustered++;
+    if (!isPositionSafeFromEnemyFire(mySlot.position)) {
+        const threat = closestTo(mySlot.position, livingEnemies());
+        if (threat) cat.move(safeRetreat(cat, threat.position, 20));
+        return true;
+    }
+    // Keep 250+ from other enemies when moving to surround slot
+    if (!isPositionSafeFromOtherEnemies(mySlot.position, target.id)) {
+        const threat = livingEnemies().find(e => e.id !== target.id && dist(mySlot.position, e.position) < SURROUND_SAFE_FROM_OTHERS);
+        if (threat) cat.move(safeRetreat(cat, threat.position, 25));
+        return true;
+    }
+    cat.set_mark('surround');
+    cat.move(mySlot.position);
+    return true;
+}
+
+/** Move toward weak point to set up surround when we can't strike. Returns true if moved. */
+function doSurroundApproach(cat, me) {
+    if (!me || (me.role !== 'aggro' && me.role !== 'support' && me.role !== 'connector' && me.name !== 'Ziggy')) return false;
+    const lowEnergy = cat.energy < 5 || cat.energy < cat.energy_capacity * 0.3;
+    if (lowEnergy) return false;
+    const weak = weakPointTarget();
+    if (!weak || teamCanEngage(weak)) return false;
+    const spreadAngle = me ? (me.index % 3 - 1) * 0.2 : 0;
+    const dx = weak.position[0] - cat.position[0];
+    const dy = weak.position[1] - cat.position[1];
+    const baseAngle = Math.atan2(dy, dx) + spreadAngle;
+    const step = 20;
+    let approachPos = [
+        cat.position[0] + Math.cos(baseAngle) * step,
+        cat.position[1] + Math.sin(baseAngle) * step,
+    ];
+    const others = livingEnemies().filter(e => e.id !== weak.id);
+    for (const o of others) {
+        if (dist(approachPos, o.position) < SURROUND_SAFE_FROM_OTHERS) {
+            const awayDir = [approachPos[0] - o.position[0], approachPos[1] - o.position[1]];
+            const len = Math.sqrt(awayDir[0] ** 2 + awayDir[1] ** 2) || 1;
+            approachPos = [
+                o.position[0] + (awayDir[0] / len) * SURROUND_SAFE_FROM_OTHERS,
+                o.position[1] + (awayDir[1] / len) * SURROUND_SAFE_FROM_OTHERS,
+            ];
+            break;
+        }
+    }
+    cat.move(approachPos);
+    return true;
+}
+
+function maybeStartSurround() {
+    if (memory.surround) return;
+    if (endgameState()) return;
+    const target = weakPointTarget();
+    if (!target || isOnPod(target.position)) return;
+    // Only start surround when we can't strike — striking is always the priority
+    if (teamCanEngage(target)) return;
+    const positions = getSurroundPositions(target, SURROUND_RADIUS);
+    if (!positions.every(p => isPositionSafeFromEnemyFire(p))) return;
+    // Require pew-safe (220) from others to start; we'll keep 250+ when moving
+    if (!positions.every(p => isPositionSafeFromOtherEnemies(p, target.id, PEW_RANGE_NEXT_TICK))) return;
+    const assignments = pickSurroundCats(target);
+    if (assignments.length < 4) return;
+    memory.surround = {
+        targetId: target.id,
+        phase: 'positioning',
+        assignments: assignments,
+        readyCount: 0,
+    };
+}
+
+function updateSurroundPhase() {
+    const s = memory.surround;
+    if (!s) return;
+    const target = cats[s.targetId];
+    if (!target || target.hp <= 0) {
+        memory.surround = null;
+        return;
+    }
+    let aliveCount = 0;
+    for (const a of s.assignments) {
+        const c = cats[a.catId];
+        if (c && c.hp > 0) aliveCount++;
+    }
+    if (aliveCount < 3) {
+        memory.surround = null;
+        return;
+    }
+    if (s.phase === 'strike') return;
+
+    if (s.phase === 'positioning') {
+        let ready = 0;
+        for (const a of s.assignments) {
+            const c = cats[a.catId];
+            if (!c || c.hp <= 0) continue;
+            if (dist(c.position, a.position) <= 40) ready++;
+        }
+        if (ready >= aliveCount) {
+            s.phase = 'closing';
+        }
+        return;
+    }
+
+    if (s.phase === 'closing') {
+        let allCanStrike = true;
+        for (const a of s.assignments) {
+            const c = cats[a.catId];
+            if (!c || c.hp <= 0) continue;
+            if (dist(c.position, target.position) > SURROUND_STRIKE_RANGE) {
+                allCanStrike = false;
                 break;
             }
         }
+        if (allCanStrike) {
+            s.phase = 'strike';
+        }
     }
-    const effectiveEnemies = Math.max(1, enemiesNear - Math.floor(clustered / 2));
-
-    const diff = energyDiff();
-    if (diff > 20) return convergers >= effectiveEnemies;
-    if (diff > -20) return convergers > effectiveEnemies;
-    return convergers >= effectiveEnemies + 2;
 }
 
 // ============================================================
@@ -400,8 +744,8 @@ function thinkAggro(cat) {
     }
     const effectiveThreats = Math.max(1, inDangerZone - Math.floor(clustered / 2));
 
-    // RETREAT only when outnumbered in kill zone AND enemies aren't clustered
-    if (inKillZone >= 2 && alliesHere <= inKillZone && clustered === 0) {
+    // RETREAT when in pew range and engagement is unfavorable (unless we have majority + energy advantage)
+    if (inKillZone >= 2 && clustered === 0 && closest && !teamCanEngage(closest) && !hasMajorityAdvantage()) {
         const healers = catsByRole('healer');
         const retreatPoint = healers.length > 0
             ? centroid(healers.map(c => c.position))
@@ -410,19 +754,28 @@ function thinkAggro(cat) {
         return;
     }
 
-    // FLEE only when outnumbered AND enemies are spread out
-    if (effectiveThreats >= 3 && alliesHere < effectiveThreats) {
+    // FLEE only when outnumbered AND enemies are spread out (unless we have majority + energy advantage)
+    if (!hasMajorityAdvantage() && effectiveThreats >= 3 && alliesHere < effectiveThreats) {
         const threatCenter = centroid(nearby.map(e => e.position));
-        cat.move(away(cat.position, threatCenter, 100));
+        cat.move(safeRetreat(cat, threatCenter, 100));
         return;
     }
 
     // TEAM ENGAGE: if the team has converged and has numbers, strike
     // (skip if target is camping a pod — let the circle flush them out)
     const sharedTarget = aggroSharedTarget();
-    if (sharedTarget && teamCanEngage(sharedTarget) && !isOnPod(sharedTarget.position)) {
+    if (sharedTarget && (teamCanEngage(sharedTarget) || hasMajorityAdvantage()) && !isOnPod(sharedTarget.position)) {
         const d = dist(cat.position, sharedTarget.position);
-        if (d > 190) cat.move(sharedTarget.position);
+        if (d > PEW_RANGE) {
+            cat.move(sharedTarget.position);
+        } else {
+            const pred = predictPotentialFocusFire(cat);
+            if (pred) {
+                cat.move(safeRetreat(cat, pred.threatCenter, 35));
+            } else {
+                cat.move(away(cat.position, sharedTarget.position, 20));
+            }
+        }
         return;
     }
 
@@ -433,17 +786,94 @@ function thinkAggro(cat) {
     const podBonus = isOnPod(myTarget.position) ? 20 : 0;
     let minSafe, maxSafe;
     if (alliesHere > effectiveThreats) {
-        minSafe = 225 + adj + podBonus; maxSafe = 255 + adj + podBonus;
+        minSafe = 205 + adj + podBonus; maxSafe = 235 + adj + podBonus;
     } else if (alliesHere >= effectiveThreats) {
-        minSafe = 250 + adj + podBonus; maxSafe = 280 + adj + podBonus;
+        minSafe = 225 + adj + podBonus; maxSafe = 255 + adj + podBonus;
     } else {
-        minSafe = 280 + adj + podBonus; maxSafe = 310 + adj + podBonus;
+        minSafe = 250 + adj + podBonus; maxSafe = 280 + adj + podBonus;
     }
 
     if (closestDist < minSafe) {
-        cat.move(away(cat.position, closest.position, 100));
+        if (hasMajorityAdvantage()) {
+            const target = (sharedTarget && !isOnPod(sharedTarget.position)) ? sharedTarget : myTarget;
+            cat.move(target.position);
+        } else {
+            cat.move(safeRetreat(cat, closest.position, 100));
+        }
     } else if (dist(cat.position, myTarget.position) > maxSafe) {
-        cat.move(myTarget.position);
+        const { safeToStrike } = engagementCounts(myTarget);
+        if (safeToStrike || hasMajorityAdvantage()) {
+            const me = identity(cat);
+            const spreadAngle = me ? (me.index % 3 - 1) * 0.15 : 0;
+            const dx = myTarget.position[0] - cat.position[0];
+            const dy = myTarget.position[1] - cat.position[1];
+            const baseAngle = Math.atan2(dy, dx) + spreadAngle;
+            const step = 25;
+            const approachPos = [
+                cat.position[0] + Math.cos(baseAngle) * step,
+                cat.position[1] + Math.sin(baseAngle) * step,
+            ];
+            cat.move(approachPos);
+        } else {
+            if (!doSurroundApproach(cat, identity(cat))) {
+                const lowEnergy = cat.energy < 5 || cat.energy < cat.energy_capacity * 0.3;
+                if (lowEnergy && closest) cat.move(safeRetreat(cat, closest.position, 30));
+            }
+        }
+    } else {
+        // Between minSafe and maxSafe — advance when we outnumber, else surround approach
+        const d = dist(cat.position, myTarget.position);
+        if (d > PEW_RANGE) {
+            const { ours, theirs, safeToStrike } = engagementCounts(myTarget);
+            if ((safeToStrike && ours > theirs) || hasMajorityAdvantage()) {
+                const me = identity(cat);
+                const spreadAngle = me ? (me.index % 3 - 1) * 0.12 : 0;
+                const dx = myTarget.position[0] - cat.position[0];
+                const dy = myTarget.position[1] - cat.position[1];
+                const baseAngle = Math.atan2(dy, dx) + spreadAngle;
+                const step = 25;
+                cat.move([
+                    cat.position[0] + Math.cos(baseAngle) * step,
+                    cat.position[1] + Math.sin(baseAngle) * step,
+                ]);
+            } else {
+                const lowEnergy = cat.energy < 5 || cat.energy < cat.energy_capacity * 0.3;
+                if (lowEnergy && closest) {
+                    cat.move(safeRetreat(cat, closest.position, 30));
+                } else {
+                const weak = weakPointTarget();
+                if (weak && !teamCanEngage(weak)) {
+                    const me = identity(cat);
+                    const spreadAngle = me ? (me.index % 3 - 1) * 0.2 : 0;
+                    const dx = weak.position[0] - cat.position[0];
+                    const dy = weak.position[1] - cat.position[1];
+                    const baseAngle = Math.atan2(dy, dx) + spreadAngle;
+                    const step = 18;
+                    let approachPos = [
+                        cat.position[0] + Math.cos(baseAngle) * step,
+                        cat.position[1] + Math.sin(baseAngle) * step,
+                    ];
+                    // Avoid moving within 250 of other enemies
+                    const others = livingEnemies().filter(e => e.id !== weak.id);
+                    for (const o of others) {
+                        if (dist(approachPos, o.position) < SURROUND_SAFE_FROM_OTHERS) {
+                            const awayDir = [
+                                approachPos[0] - o.position[0],
+                                approachPos[1] - o.position[1],
+                            ];
+                            const len = Math.sqrt(awayDir[0] ** 2 + awayDir[1] ** 2) || 1;
+                            approachPos = [
+                                o.position[0] + (awayDir[0] / len) * SURROUND_SAFE_FROM_OTHERS,
+                                o.position[1] + (awayDir[1] / len) * SURROUND_SAFE_FROM_OTHERS,
+                            ];
+                            break;
+                        }
+                    }
+                    cat.move(approachPos);
+                }
+                }
+            }
+        }
     }
 }
 
@@ -481,9 +911,16 @@ function thinkConnector(cat) {
 
     const aggroCenter = centroid(aggroCats.map(c => c.position));
     const healerCenter = centroid(healerCats.map(c => c.position));
+    const enemies = livingEnemies();
+    const distToEnemies = enemies.length > 0
+        ? Math.min(...enemies.map(e => dist(cat.position, e.position)))
+        : 400;
 
     const me = identity(cat);
-    const t = me.name === 'Claw' ? 2 / 3 : 1 / 3;
+    let t = me.name === 'Claw' ? 2 / 3 : 1 / 3;
+    if (distToEnemies > 300) {
+        t = me.name === 'Claw' ? 0.85 : 0.35;
+    }
     const bridgePoint = [
         healerCenter[0] + (aggroCenter[0] - healerCenter[0]) * t,
         healerCenter[1] + (aggroCenter[1] - healerCenter[1]) * t,
@@ -517,12 +954,30 @@ function thinkCrazy(cat) {
     if (others.length > 0) {
         const closestOther = closestTo(cat.position, others);
         if (closestOther && dist(cat.position, closestOther.position) < 235) {
-            cat.move(away(cat.position, closestOther.position, 25));
+            const ours = aliveOf(my_cats);
+            if (ours.length > 1) {
+                const teamCenter = centroid(ours.filter(c => c.id !== cat.id).map(c => c.position));
+                cat.move(towards(cat.position, teamCenter, 25));
+            } else {
+                cat.move(safeRetreat(cat, closestOther.position, 25));
+            }
             return;
         }
     }
 
     if (maxD <= 200) return;
+
+    if (!teamCanEngage(target)) {
+        const ours = aliveOf(my_cats);
+        if (ours.length > 1) {
+            const teamCenter = centroid(ours.filter(c => c.id !== cat.id).map(c => c.position));
+            cat.move(towards(cat.position, teamCenter, 30));
+        } else {
+            const closestEnemy = closestTo(cat.position, enemies);
+            if (closestEnemy) cat.move(safeRetreat(cat, closestEnemy.position, 30));
+        }
+        return;
+    }
 
     if (others.length === 0) {
         cat.move(target.position);
@@ -564,7 +1019,15 @@ function thinkCrazy(cat) {
     }
 
     const threat = closestTo(cat.position, others);
-    if (threat) cat.move(away(cat.position, threat.position, 20));
+    if (threat) {
+        const ours = aliveOf(my_cats);
+        if (ours.length > 1) {
+            const teamCenter = centroid(ours.filter(c => c.id !== cat.id).map(c => c.position));
+            cat.move(towards(cat.position, teamCenter, 20));
+        } else {
+            cat.move(safeRetreat(cat, threat.position, 20));
+        }
+    }
 }
 
 // --- Default fallback (used by any unnamed cats) ---
@@ -872,9 +1335,16 @@ function thinkAllInCombat(cat) {
     const target = allInTarget();
     if (!target) { cat.move([0, 0]); return; }
 
+    const pred = predictPotentialFocusFire(cat);
+    if (pred) {
+        cat.move(safeRetreat(cat, pred.threatCenter, 35));
+        return;
+    }
     const d = dist(cat.position, target.position);
     if (d > 185) {
         cat.move(target.position);
+    } else {
+        cat.move(away(cat.position, target.position, 20));
     }
 }
 
@@ -921,7 +1391,7 @@ function mind(cat) {
     cat.move = function(target) {
         let t = target;
 
-        if (inCombat) {
+        if (inCombat && me.name !== 'Ziggy') {
             let closestAlly = null, closestAllyDist = Infinity;
             for (const f of aliveOf(my_cats)) {
                 if (f.id === cat.id) continue;
@@ -968,7 +1438,7 @@ function mind(cat) {
     // ── Phase 2: FRIENDLY PEW (heal / relay, only when no enemy pewed) ──
     if (!pewedEnemy) supportPew(cat, me);
 
-    // ── Phase 2.1: PATIENCE MODE — enemy mass-camping pods, wait for circle ──
+    // ── Phase 2.1: PATIENCE MODE — enemy mass-camping pods ──
     {
         const enemies = livingEnemies();
         let enemiesOnPods = 0;
@@ -977,16 +1447,50 @@ function mind(cat) {
             const safeBuffer = enemiesOnPods >= 5 ? 40 : 20;
             const nearest = closestTo(cat.position, enemies);
             if (nearest && dist(cat.position, nearest.position) < 200 + safeBuffer) {
-                cat.move(away(cat.position, nearest.position, 30));
+                cat.move(safeRetreat(cat, nearest.position, 30));
             } else if (cat.energy < cat.energy_capacity && !isOnPod(cat.position)) {
-                // Nothing better to do — charge in a safe pod while waiting
-                const pod = nearestSafePod(cat.position);
                 const lowEnergy = cat.energy < 5 || cat.energy < cat.energy_capacity * 0.3;
+                const pod = lowEnergy ? nearestSafePod(cat.position, PEW_RANGE_NEXT_TICK) : nearestSafePod(cat.position);
                 const closeToPod = pod && dist(cat.position, pod) <= 120;
                 if (lowEnergy && closeToPod) {
                     cat.move(pod);
+                } else {
+                    doSurroundApproach(cat, me);
                 }
+            } else {
+                doSurroundApproach(cat, me);
             }
+            return;
+        }
+    }
+
+    // ── Phase 2.2: LOW ENERGY POD PRIORITY — stay 220+ from enemies, prioritize charging ──
+    {
+        const lowEnergy = cat.energy < 5 || cat.energy < cat.energy_capacity * 0.3;
+        if (lowEnergy && !isOnPod(cat.position) && !hasMajorityAdvantage()) {
+            const enemies = livingEnemies();
+            const nearestE = closestTo(cat.position, enemies);
+            if (nearestE && dist(cat.position, nearestE.position) < PEW_RANGE_NEXT_TICK) {
+                cat.move(safeRetreat(cat, nearestE.position, 30));
+                return;
+            }
+            const pod = nearestSafePod(cat.position, PEW_RANGE_NEXT_TICK);
+            if (pod) {
+                cat.move(pod);
+                return;
+            }
+            if (nearestE && dist(cat.position, nearestE.position) < 250) {
+                cat.move(safeRetreat(cat, nearestE.position, 25));
+                return;
+            }
+        }
+    }
+
+    // ── Phase 2.3: PREDICT POTENTIAL FOCUS-FIRE — retreat before enemies move into range ──
+    {
+        const pred = predictPotentialFocusFire(cat);
+        if (pred) {
+            cat.move(safeRetreat(cat, pred.threatCenter, 35));
             return;
         }
     }
@@ -1001,20 +1505,32 @@ function mind(cat) {
         return;
     }
 
+    // ── Phase 2.7: SURROUND PLAN (stall-breaker: 4 cats circle at 270, then strike) ──
+    if (memory.surround && thinkSurround(cat, me)) {
+        return;
+    }
+
+    // ── Phase 2.8: SURROUND APPROACH — when we can't strike, move toward weak point (no passive wait) ──
+    if (doSurroundApproach(cat, me)) {
+        return;
+    }
+
     // ── Phase 3: DANGER EVASION (non-frontline cats) ──
     if (me.role !== 'aggro' && me.role !== 'crazy' && me.role !== 'support') {
-        const enemies = livingEnemies();
-        const adj = aggressionMod();
-        const nearestE = closestTo(cat.position, enemies);
-        const podBon = (nearestE && isOnPod(nearestE.position)) ? 20 : 0;
-        const fleeRange = 255 + adj + podBon;
-        const threats = enemies.filter(e => dist(cat.position, e.position) < fleeRange);
-        if (threats.length > 0) {
-            const alliesHere = friendsInRange(cat.position, 260);
-            if (alliesHere <= threats.length) {
-                const threatCenter = centroid(threats.map(e => e.position));
-                cat.move(away(cat.position, threatCenter, 100));
-                return;
+        if (!hasMajorityAdvantage()) {
+            const enemies = livingEnemies();
+            const adj = aggressionMod();
+            const nearestE = closestTo(cat.position, enemies);
+            const podBon = (nearestE && isOnPod(nearestE.position)) ? 20 : 0;
+            const fleeRange = 255 + adj + podBon;
+            const threats = enemies.filter(e => dist(cat.position, e.position) < fleeRange);
+            if (threats.length > 0) {
+                const alliesHere = friendsInRange(cat.position, 260);
+                if (alliesHere <= threats.length) {
+                    const threatCenter = centroid(threats.map(e => e.position));
+                    cat.move(safeRetreat(cat, threatCenter, 100));
+                    return;
+                }
             }
         }
     }
@@ -1026,15 +1542,19 @@ function mind(cat) {
         return;
     }
     if (cat.energy < cat.energy_capacity && !isOnPod(cat.position)) {
-        let pod = nearestSafePod(cat.position);
+        const lowEnergy = cat.energy < 5 || cat.energy < cat.energy_capacity * 0.3;
+        let pod = lowEnergy ? nearestSafePod(cat.position, PEW_RANGE_NEXT_TICK) : nearestSafePod(cat.position);
         if (!pod && (cat.energy < 3 || cat.energy < cat.energy_capacity * 0.2)) {
             pod = nearestSafePod(cat.position, 150);
         }
         if (pod) {
-            const lowEnergy = cat.energy < 5 || cat.energy < cat.energy_capacity * 0.3;
             if (lowEnergy) {
-                // Low energy: always go charge, no distance limit (overrides connectors, etc.)
-                cat.move(pod);
+                const nearestE = closestTo(cat.position, livingEnemies());
+                if (nearestE && dist(cat.position, nearestE.position) < PEW_RANGE_NEXT_TICK) {
+                    cat.move(safeRetreat(cat, nearestE.position, 30));
+                } else {
+                    cat.move(pod);
+                }
                 return;
             }
             const d = dist(cat.position, pod);
@@ -1061,6 +1581,12 @@ function mind(cat) {
 // ============================================================
 
 initLedger();
+updateStallHistory();
+// Proactively seek surround when we can't strike (replaces passive "wait" phase)
+maybeStartSurround();
+if (memory.surround) {
+    updateSurroundPhase();
+}
 
 const alive = aliveOf(my_cats);
 for (const cat of alive) {

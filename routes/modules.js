@@ -74,7 +74,13 @@ module.exports = function createModuleRoutes({ logger, check_limiter, s3client, 
 			});
 			return;
 		} catch (err) {
+			if (err && (err.code === 'NoSuchKey' || err.statusCode === 404)) {
+				logger.warn({ module_id, script_type }, 'Requested module script missing in object storage');
+				res.status(404).send({ data: 'script not found' });
+				return;
+			}
 			logger.error(err);
+			res.status(500).send({ data: 'script download failed' });
 		}
 	});
 
