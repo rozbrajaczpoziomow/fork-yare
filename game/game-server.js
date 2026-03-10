@@ -8,7 +8,6 @@ const config = require('../config');
 const path = require('path');
 const fetch = require('node-fetch');
 const pino = require('pino');
-require('isolated-vm');
 
 const { generateUniqueString, get_color_num } = require('../utils/helpers');
 
